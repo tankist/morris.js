@@ -26,8 +26,33 @@ class Morris.Line
     if @options.data is undefined or @options.data.length is 0
       return
     @el.addClass 'graph-initialised'
-    @precalc()
-    @redraw()
+
+    # the raphael drawing instance
+    @r = new Raphael(@el[0])
+
+    # Some instance variables for later
+    @pointGrow = Raphael.animation r: @options.pointSize + 3, 25, 'linear'
+    @pointShrink = Raphael.animation r: @options.pointSize, 25, 'linear'
+    @elementWidth = null
+    @elementHeight = null
+    @dirty = false
+    # column hilight events
+    @prevHilight = null
+    @el.mousemove (evt) =>
+      @updateHilight evt.pageX
+    if @options.hideHover
+      @el.mouseout (evt) =>
+        @hilight null
+    touchHandler = (evt) =>
+      touch = evt.originalEvent.touches[0] or evt.originalEvent.changedTouches[0]
+      @updateHilight touch.pageX
+      return touch
+    @el.bind 'touchstart', touchHandler
+    @el.bind 'touchmove', touchHandler
+    @el.bind 'touchend', touchHandler
+
+    @seriesLabels = @options.labels
+    @setData(@options.data)
 
   # Default configuration
   #
@@ -72,22 +97,24 @@ class Morris.Line
     xLabels: 'auto'
     xLabelFormat: null
 
-  # Do any necessary pre-processing for a new dataset
+  # Pre-process data
   #
-  precalc: ->
+  setData: (data, redraw = true) ->
     # shallow copy & sort data
-    @options.data = @options.data.slice(0)
+    @options.data = data.slice(0)
     @options.data.sort (a, b) => (a[@options.xkey] < b[@options.xkey]) - (b[@options.xkey] < a[@options.xkey])
     # extract labels
     @columnLabels = $.map @options.data, (d) => d[@options.xkey]
-    @seriesLabels = @options.labels
 
     # extract series data
     @series = []
     for ykey in @options.ykeys
       series_data = []
       for d in @options.data
-        series_data.push(d[ykey] or 0)
+        series_data.push switch typeof d[ykey]
+          when 'number' then d[ykey]
+          when 'string' then parseFloat(d[ykey])
+          else null
       @series.push(series_data)
 
     # translate x labels into nominal dates
@@ -114,51 +141,47 @@ class Morris.Line
       # use Array.concat to flatten arrays and find the max y value
       ymax = Math.max.apply null, Array.prototype.concat.apply([], @series)
       if @options.ymax.length > 5
-        @options.ymax = Math.max parseInt(@options.ymax[5..], 10), ymax
+        @ymax = Math.max parseInt(@options.ymax[5..], 10), ymax
       else
-        @options.ymax = ymax
+        @ymax = ymax
     if typeof @options.ymin is 'string' and @options.ymin[0..3] is 'auto'
       ymin = Math.min.apply null, Array.prototype.concat.apply([], @series)
       if @options.ymin.length > 5
-        @options.ymin = Math.min parseInt(@options.ymin[5..], 10), ymin
+        @ymin = Math.min parseInt(@options.ymin[5..], 10), ymin
       else
-        @options.ymin = ymin
+        @ymin = ymin
+    if @ymin is @ymax
+      @ymin -= 1
+      @ymax += 1
 
-    # Some instance variables for later
-    @pointGrow = Raphael.animation r: @options.pointSize + 3, 25, 'linear'
-    @pointShrink = Raphael.animation r: @options.pointSize, 25, 'linear'
-    @elementWidth = null
-    @elementHeight = null
-    # column hilight events
-    @prevHilight = null
-    @el.mousemove (evt) =>
-      @updateHilight evt.pageX
-    if @options.hideHover
-      @el.mouseout (evt) =>
-        @hilight null
-    touchHandler = (evt) =>
-      touch = evt.originalEvent.touches[0] or evt.originalEvent.changedTouches[0]
-      @updateHilight touch.pageX
-      return touch
-    @el.bind 'touchstart', touchHandler
-    @el.bind 'touchmove', touchHandler
-    @el.bind 'touchend', touchHandler
+    @yInterval = (@ymax - @ymin) / (@options.numLines - 1)
+    if @yInterval > 0 and @yInterval < 1
+        @precision =  -Math.floor(Math.log(@yInterval) / Math.log(10))
+    else
+        @precision = 0
+
+    @dirty = true
+    @redraw() if redraw
 
   # Do any size-related calculations
   #
   calc: ->
     w = @el.width()
     h = @el.height()
-    if @elementWidth != w or @elementHeight != h
+
+    if @elementWidth != w or @elementHeight != h or @dirty
+      @elementWidth = w
+      @elementHeight = h
+      @dirty = false
       # calculate grid dimensions
       @maxYLabelWidth = Math.max(
-        @measureText(@yLabelFormat(@options.ymin), @options.gridTextSize).width,
-        @measureText(@yLabelFormat(@options.ymax), @options.gridTextSize).width)
+        @measureText(@yLabelFormat(@ymin), @options.gridTextSize).width,
+        @measureText(@yLabelFormat(@ymax), @options.gridTextSize).width)
       @left = @maxYLabelWidth + @options.marginLeft
       @width = @el.width() - @left - @options.marginRight
       @height = @el.height() - @options.marginTop - @options.marginBottom
       @dx = @width / (@xmax - @xmin)
-      @dy = @height / (@options.ymax - @options.ymin)
+      @dy = @height / (@ymax - @ymin)
       # calculate series data point coordinates
       @columns = (@transX(x) for x in @xvals)
       @seriesCoords = []
@@ -182,17 +205,12 @@ class Morris.Line
      @left + (x - @xmin) * @dx
 
   transY: (y) =>
-    return @options.marginTop + @height - (y - @options.ymin) * @dy
+    return @options.marginTop + @height - (y - @ymin) * @dy
 
   # Clear and redraw the graph
   #
   redraw: ->
-    # remove child elements (get rid of old drawings)
-    @el.empty()
-
-    # the raphael drawing instance
-    @r = new Raphael(@el[0])
-
+    @r.clear()
     @calc()
     @drawGrid()
     @drawSeries()
@@ -203,11 +221,12 @@ class Morris.Line
   #
   drawGrid: ->
     # draw y axis labels, horizontal lines
-    yInterval = (@options.ymax - @options.ymin) / (@options.numLines - 1)
-    firstY = Math.ceil(@options.ymin / yInterval) * yInterval
-    lastY = Math.floor(@options.ymax / yInterval) * yInterval
-    for lineY in [firstY..lastY] by yInterval
-      v = Math.floor(lineY)
+    firstY = @ymin
+    lastY = @ymax
+
+
+    for lineY in [firstY..lastY] by @yInterval
+      v = parseFloat(lineY.toFixed(@precision))
       y = @transY(v)
       @r.text(@left - @options.marginLeft/2, y, @yLabelFormat(v))
         .attr('font-size', @options.gridTextSize)
@@ -226,8 +245,10 @@ class Morris.Line
         .attr('font-size', @options.gridTextSize)
         .attr('fill', @options.gridTextColor)
       labelBox = label.getBBox()
-      # ensure a minimum of `xLabelMargin` pixels between labels
-      if prevLabelMargin is null or prevLabelMargin <= labelBox.x
+      # ensure a minimum of `xLabelMargin` pixels between labels, and ensure
+      # labels don't overflow the container
+      if (prevLabelMargin is null or prevLabelMargin <= labelBox.x) and
+          labelBox.x >= 0 and (labelBox.x + labelBox.width) < @el.width()
         prevLabelMargin = labelBox.x + labelBox.width + xLabelMargin
       else
         label.remove()
@@ -249,7 +270,7 @@ class Morris.Line
   #
   drawSeries: ->
     for i in [@seriesCoords.length-1..0]
-      coords = @seriesCoords[i]
+      coords = $.map(@seriesCoords[i], (c) -> c)
       if coords.length > 1
         path = @createPath coords, @options.marginTop, @left, @options.marginTop + @height, @left + @width
         @r.path(path)
@@ -269,9 +290,8 @@ class Morris.Line
 
   # create a path for a data series
   #
-  createPath: (all_coords, top, left, bottom, right) ->
+  createPath: (coords, top, left, bottom, right) ->
     path = ""
-    coords = $.map(all_coords, (c) -> c)
     if @options.smooth
       grads = @gradients coords
       for i in [0..coords.length-1]
